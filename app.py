@@ -1494,49 +1494,203 @@ def admin_page():
 
     # ─── 탭 1: 사용량 통계 ───────────────────────────────
     with tab_stats:
-        st.subheader("💰 전체 사용량 통계")
+        from collections import defaultdict
+        from datetime import timedelta
 
-        total_calls = len(logs)
-        total_input = sum(l.get("input_tokens", 0) for l in logs)
-        total_output = sum(l.get("output_tokens", 0) for l in logs)
-        total_cost_usd = sum(l.get("cost_usd", 0) for l in logs)
-        total_cost_krw = total_cost_usd * USD_TO_KRW
+        st.subheader("💰 사용량 통계")
+
+        # ── 기간 선택 ──
+        col_period, col_range = st.columns([1, 1])
+        with col_period:
+            period = st.radio(
+                "집계 단위",
+                ["📅 일별", "📆 주별", "🗓️ 월별"],
+                horizontal=True,
+                key="usage_period"
+            )
+        with col_range:
+            if "일별" in period:
+                lookback_days = st.selectbox("기간", [7, 14, 30, 60, 90], index=2,
+                                              format_func=lambda x: f"최근 {x}일")
+            elif "주별" in period:
+                lookback_weeks = st.selectbox("기간", [4, 8, 12, 24], index=1,
+                                               format_func=lambda x: f"최근 {x}주")
+                lookback_days = lookback_weeks * 7
+            else:  # 월별
+                lookback_months = st.selectbox("기간", [3, 6, 12], index=1,
+                                                format_func=lambda x: f"최근 {x}개월")
+                lookback_days = lookback_months * 31
+
+        # 기간 필터링
+        today = date.today()
+        cutoff = today - timedelta(days=lookback_days)
+        period_logs = [
+            l for l in logs
+            if l.get("timestamp", "")[:10] >= cutoff.isoformat()
+        ]
+
+        st.divider()
+
+        # ── 4개 핵심 메트릭 (오늘 / 이번주 / 이번달 / 기간 전체) ──
+        today_str = today.isoformat()
+        week_start = (today - timedelta(days=today.weekday())).isoformat()
+        month_start = today.replace(day=1).isoformat()
+        yesterday_str = (today - timedelta(days=1)).isoformat()
+
+        today_logs = [l for l in logs if l.get("timestamp", "")[:10] == today_str]
+        yesterday_logs = [l for l in logs if l.get("timestamp", "")[:10] == yesterday_str]
+        week_logs = [l for l in logs if l.get("timestamp", "")[:10] >= week_start]
+        month_logs = [l for l in logs if l.get("timestamp", "")[:10] >= month_start]
+
+        today_cost = sum(l.get("cost_usd", 0) for l in today_logs)
+        yesterday_cost = sum(l.get("cost_usd", 0) for l in yesterday_logs)
+        week_cost = sum(l.get("cost_usd", 0) for l in week_logs)
+        month_cost = sum(l.get("cost_usd", 0) for l in month_logs)
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("전체 호출", f"{total_calls:,}회")
-        col2.metric("입력 토큰", f"{total_input:,}")
-        col3.metric("출력 토큰", f"{total_output:,}")
-        col4.metric("누적 비용", f"${total_cost_usd:.2f}",
-                    delta=f"₩{total_cost_krw:,.0f}", delta_color="off")
+        with col1:
+            delta_today = len(today_logs) - len(yesterday_logs)
+            st.metric("📅 오늘", f"{len(today_logs)}회",
+                      delta=f"{delta_today:+d} vs 어제" if delta_today != 0 else None,
+                      help=f"₩{today_cost*USD_TO_KRW:,.0f}")
+        with col2:
+            st.metric("📆 이번주", f"{len(week_logs)}회",
+                      help=f"₩{week_cost*USD_TO_KRW:,.0f}")
+        with col3:
+            st.metric("🗓️ 이번달", f"{len(month_logs)}회",
+                      help=f"₩{month_cost*USD_TO_KRW:,.0f}")
+        with col4:
+            total_cost = sum(l.get("cost_usd", 0) for l in logs)
+            st.metric("💎 누적 비용", f"₩{total_cost*USD_TO_KRW:,.0f}",
+                      help=f"${total_cost:.2f}")
 
         st.divider()
 
-        # 사용자별 비용 순위
-        render_section(st, "👤 사용자별 비용 순위 TOP 10")
-        user_costs = {}
-        user_calls = {}
-        for log in logs:
-            email = log.get("email", "unknown")
-            user_costs[email] = user_costs.get(email, 0) + log.get("cost_usd", 0)
-            user_calls[email] = user_calls.get(email, 0) + 1
+        # ── 기간별 집계 + 차트 ──
+        render_section(st, f"📊 {period} 사용량 추이")
 
-        if user_costs:
-            sorted_users = sorted(user_costs.items(), key=lambda x: x[1], reverse=True)[:10]
-            for i, (email, cost) in enumerate(sorted_users, 1):
-                col1, col2, col3, col4 = st.columns([1, 4, 2, 2])
-                col1.write(f"**{i}**")
-                col2.write(email)
-                col3.write(f"{user_calls[email]}회")
-                col4.write(f"${cost:.3f} (₩{cost*USD_TO_KRW:,.0f})")
+        # 데이터 집계
+        bucket_calls = defaultdict(int)
+        bucket_cost = defaultdict(float)
+        bucket_tokens = defaultdict(int)
+
+        for log in period_logs:
+            ts = log.get("timestamp", "")
+            if not ts:
+                continue
+
+            log_date = ts[:10]  # YYYY-MM-DD
+
+            if "일별" in period:
+                bucket_key = log_date
+            elif "주별" in period:
+                # ISO 주 번호 (월요일 시작)
+                try:
+                    log_dt = datetime.strptime(log_date, "%Y-%m-%d").date()
+                    year, week_num, _ = log_dt.isocalendar()
+                    bucket_key = f"{year}-W{week_num:02d}"
+                except Exception:
+                    continue
+            else:  # 월별
+                bucket_key = log_date[:7]  # YYYY-MM
+
+            bucket_calls[bucket_key] += 1
+            bucket_cost[bucket_key] += log.get("cost_usd", 0)
+            bucket_tokens[bucket_key] += log.get("input_tokens", 0) + log.get("output_tokens", 0)
+
+        if bucket_calls:
+            # 시간순 정렬
+            sorted_buckets = sorted(bucket_calls.keys())
+
+            # Streamlit 내장 차트 데이터 준비
+            try:
+                import pandas as pd
+                chart_data = pd.DataFrame({
+                    "기간": sorted_buckets,
+                    "호출 수": [bucket_calls[b] for b in sorted_buckets],
+                    "비용(원)": [round(bucket_cost[b] * USD_TO_KRW) for b in sorted_buckets],
+                })
+                chart_data = chart_data.set_index("기간")
+
+                # 호출 수 바 차트
+                st.write("**호출 수**")
+                st.bar_chart(chart_data["호출 수"], height=250)
+
+                # 비용 라인 차트
+                st.write("**비용 추이 (KRW)**")
+                st.line_chart(chart_data["비용(원)"], height=200)
+            except ImportError:
+                # pandas 없으면 간단한 progress bar로 대체
+                max_calls = max(bucket_calls.values())
+                for b in sorted_buckets:
+                    pct = bucket_calls[b] / max_calls if max_calls else 0
+                    st.write(f"**{b}**: {bucket_calls[b]}회 / ₩{bucket_cost[b]*USD_TO_KRW:,.0f}")
+                    st.progress(pct)
+
+            # 상세 테이블
+            with st.expander("📋 상세 집계 보기"):
+                for b in reversed(sorted_buckets):
+                    col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
+                    col1.write(f"**{b}**")
+                    col2.write(f"{bucket_calls[b]}회")
+                    col3.caption(f"{bucket_tokens[b]:,} tok")
+                    col4.write(f"₩{bucket_cost[b]*USD_TO_KRW:,.0f}")
         else:
-            st.info("아직 사용 기록이 없습니다.")
+            st.info("선택한 기간 내 사용 기록이 없습니다.")
 
         st.divider()
 
-        # 모델별 사용 분포
-        render_section(st, "🤖 모델별 사용 분포")
+        # ── 사용자별 비교 (선택 기간) ──
+        render_section(st, f"👥 사용자별 비교 ({period} 기간 내)")
+
+        user_period_calls = defaultdict(int)
+        user_period_cost = defaultdict(float)
+        user_today_calls = defaultdict(int)
+        user_week_calls = defaultdict(int)
+
+        for log in period_logs:
+            email = log.get("email", "unknown")
+            user_period_calls[email] += 1
+            user_period_cost[email] += log.get("cost_usd", 0)
+
+        for log in today_logs:
+            user_today_calls[log.get("email", "unknown")] += 1
+        for log in week_logs:
+            user_week_calls[log.get("email", "unknown")] += 1
+
+        if user_period_calls:
+            # 헤더
+            col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 2])
+            col1.caption("**사용자**")
+            col2.caption("**오늘**")
+            col3.caption("**이번주**")
+            col4.caption("**기간 합계**")
+            col5.caption("**비용**")
+
+            # 비용 순 정렬
+            sorted_users = sorted(user_period_calls.items(),
+                                  key=lambda x: user_period_cost[x[0]], reverse=True)
+
+            for email, calls in sorted_users:
+                col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 2])
+                # 관리자 표시
+                user_info = users.get(email, {})
+                badge = " 👑" if user_info.get("is_admin") else ""
+                col1.write(f"{email}{badge}")
+                col2.write(f"{user_today_calls.get(email, 0)}회")
+                col3.write(f"{user_week_calls.get(email, 0)}회")
+                col4.write(f"**{calls}회**")
+                cost = user_period_cost[email]
+                col5.write(f"₩{cost*USD_TO_KRW:,.0f}")
+        else:
+            st.caption("해당 기간 내 사용자별 데이터 없음")
+
+        st.divider()
+
+        # ── 모델별 사용 분포 ──
+        render_section(st, "🤖 모델별 사용 분포 (기간 내)")
         model_stats = {}
-        for log in logs:
+        for log in period_logs:
             m = log.get("model", "unknown")
             if m not in model_stats:
                 model_stats[m] = {"calls": 0, "cost": 0}
@@ -1544,37 +1698,19 @@ def admin_page():
             model_stats[m]["cost"] += log.get("cost_usd", 0)
 
         if model_stats:
+            total_model_calls = sum(s["calls"] for s in model_stats.values())
             for model, stats in sorted(model_stats.items(), key=lambda x: x[1]["cost"], reverse=True):
                 label = MODEL_PRICES.get(model, {}).get("label", model)
-                col1, col2, col3 = st.columns([3, 2, 2])
+                pct = stats["calls"] / total_model_calls * 100 if total_model_calls else 0
+
+                col1, col2, col3, col4 = st.columns([3, 1, 1, 2])
                 col1.write(f"**{label}**")
                 col2.write(f"{stats['calls']}회")
-                col3.write(f"${stats['cost']:.3f}")
+                col3.write(f"{pct:.1f}%")
+                col4.write(f"₩{stats['cost']*USD_TO_KRW:,.0f}")
+                st.progress(pct / 100)
         else:
-            st.info("아직 사용 기록이 없습니다.")
-
-        st.divider()
-
-        # 일별 추이 (최근 30일)
-        render_section(st, "📅 일별 사용량 추이 (최근 30일)")
-        from collections import defaultdict
-        daily_cost = defaultdict(float)
-        daily_calls = defaultdict(int)
-        for log in logs:
-            ts = log.get("timestamp", "")
-            if ts:
-                day = ts[:10]
-                daily_cost[day] += log.get("cost_usd", 0)
-                daily_calls[day] += 1
-
-        if daily_cost:
-            sorted_days = sorted(daily_cost.keys(), reverse=True)[:30]
-            for day in sorted_days:
-                cost = daily_cost[day]
-                calls = daily_calls[day]
-                st.write(f"- **{day}**: {calls}회 / ${cost:.3f} (₩{cost*USD_TO_KRW:,.0f})")
-        else:
-            st.caption("일별 데이터 없음")
+            st.caption("해당 기간 내 모델 데이터 없음")
 
     # ─── 탭 2: 사용자 관리 ───────────────────────────────
     with tab_users:
